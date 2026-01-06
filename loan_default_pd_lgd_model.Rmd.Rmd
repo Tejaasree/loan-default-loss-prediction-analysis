@@ -1,0 +1,505 @@
+---
+title: "Project Modeling"
+date: "2025-12-05"
+output: html_document
+---
+
+```{r}
+#WORKAROUND FOR PARALLEL PROCESSING ISSUES
+#options(tidymodels.ext = "old")
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+Always set up your working directory **PLEASE GO TO SESSION AND SET UP THE WORKING DIRECTORY** 
+```{r}
+#set directory is turned off b/c I am working form a faster machine than my laptop. 
+#setwd("C:/Users/13309/OneDrive/Desktop/Kent Fall 2025/Advanced Data Mining/group project 2")
+getwd()
+```
+
+
+
+Load Models:  Originally, we were going to use caret, but it has so many parallel processing issues with XGBoost, that we abandoned it. (6 hours in trainig was very painful)
+```{r}
+library(tidymodels)
+tidymodels_prefer()
+library(foreach)  #to turn off parallel processing
+#library(doParallel)
+#library(future)
+library(xgboost)
+#plan(multisession, workers = 6) #tried to run parallel processing and it didn't work.
+#plan(sequential) #running sequential now.
+library(xgboost)
+library(ggplot2)
+library(tidyverse)
+```
+
+
+Load prepped data
+```{r}
+train_class <- readRDS("train_class_clean.rds")  # predictors + default (factor)
+train_loss  <- readRDS("train_loss_clean.rds")   # predictors + loss (defaults only)
+test_clean  <- readRDS("test_clean.rds")         # predictors only
+
+#because we pre-processed the test data to match the training data, we have to call the original test file back, so we can re-attach it, if this was part of one RMD, it could have been done inside that, but we split it up.
+
+test_raw <- read.csv("test__no_lossv3.csv")  #Load up the original test set
+test_raw$X <- NULL                            #remove the X column, just to be consistent
+Test_ID    <- test_raw$id                     #create a list of loan ID' from the test data set id column.
+
+#a little housecleaning:
+
+dim(train_class)
+dim(train_loss)
+dim(test_clean)
+```
+
+Update the default field label
+```{r}
+train_class$default <-factor(train_class$default,
+                  levels = c("0", "1"),
+                  labels = c("nondefault", "default")
+                  )
+#we're just chaning the labels, so metrics will make sense when we look at them.
+
+#lets see what it looks like
+table(train_class$default)
+
+#compute weights for xgboost (adding b/c the first tuning was very accurate 90%, but was NOT generalized!)
+num_pos <- sum(train_class$default == "default")
+num_neg <- sum(train_class$default == "nondefault")
+pos_weight <- num_neg / num_pos
+
+cat("Class weight (scale_pos_weight):", pos_weight, "\n")
+```
+
+
+Partition the default data for default data
+```{r}
+set.seed(123)   #make it repeatable
+
+split_default <- initial_split(train_class, prop = .8, strata = default)
+
+train_data <- training(split_default)
+val_data   <- testing(split_default)
+
+#sanity check to validate the splits
+dim(train_data)
+dim(val_data)
+
+table(train_data$default)
+table(val_data$default)
+
+#note that the distirbution of both classes are in line with the original dataset.  Wow, tidymodels is pretty awesome!
+
+
+```
+set up the model
+```{r}
+rec_default <- recipe(default ~., data = train_data)  |>
+
+  update_role(matches("^(ID|id)$"),  new_role =" id") |>   #doing this because during data prep, I accidentally named renamed id ID, even though this is not in the final output from data prep, I'm just being cautious. 
+  step_zv(all_predictors())  #this is where tidymodels would scale raw data, but we addressed this in data prep, so, you will get a warning that no columns were selected, which is actually want we want. 
+
+
+```
+
+
+Set up the boosted model
+```{r}
+default_spec <- boost_tree(
+  mode       = "classification",  #type of model
+  trees      =  2000,           #number of trees fixed to get where we need.
+  tree_depth =  tune(),           #depth of trees
+  learn_rate =  tune(),           #speed of learning
+  min_n      =  tune(),           #size of nodes
+  sample_size=  tune(),           #sample proportion
+  #loss_reduction = 0             #taken out b/c we had an accurate 90% model, that didn't generalize for crap.
+  )|>
+  
+set_engine("xgboost", 
+          tree_method = "hist",
+          verbose = 0,
+          scale_pos_weight = pos_weight  #adding weight due to class imbalance and initial tuning badd recall
+  )
+           #stop_iter = NULL,  #disable early stopping, so the model will complete. 
+            # Pass early stopping parameters directly to the engine via a list ADDED TO ADDRESS COMPLINING ERROR
+           #validation = 0.2, # Use 20% of each fold internally for early stopping validation
+           #early_stopping_rounds = 50 
+#)
+```
+
+Put the pieces together in a model workflow (recipe + Model & settings)
+```{r}
+wf_default <- workflow() |>    #Tidymodels sets up workflows like tidyverse uses pipe operators  wf_workflow is a workflow 
+  add_model(default_spec) |>   #that contains the default_spec specifications for the XGBoost model %>% (and then)
+  add_recipe(rec_default)      # adds the model setup  default vs train_data.
+```
+
+Set up the cross validation/ resampling
+```{r}
+set.seed(123)
+folds_default <- vfold_cv(train_data, v=3, strata = default)  #sets up the 3 fold cross validation, was 5, but needed to cut down on time.
+
+metric_set_default <- metric_set(roc_auc, accuracy)  #sets the metrics for the model
+
+                      
+grid_default <- grid_regular(             #grid to set up tuning parameter constraints CHANGED TO 1001                                            TO SEE IF THAT FIXES THE CRASHING
+  #trees(range = c(100, 1001)),            #DISABLED BECUASE WE HARDCODED 2000 TREES TO TRY TO GET                                                AROUND THE TUNING ISSUES
+  tree_depth(range =c(3L, 7L)),           #
+  learn_rate(range = c(.01, .3)),
+  min_n(range = c(10L, 50L)),
+  sample_prop(range = c(.6, .9)),
+  levels = 2                             #changed from 3 b/c of all the work
+  
+)
+
+```
+
+```{r}
+#given the way the model ws built, there was no way to knit it or rerun it without re-tuning.  On my 2 core machine, this took 8-24. so, now the model will look for saved parameters before arbitrarily tuning.
+tune_file_default  <- "xgb_default_tuning.rds"
+model_file_default <- "xgb_default_full_model.rds"
+
+if (file.exists(tune_file_default) && file.exists(model_file_default)) {
+  cat(">>> Using saved default tuning + model\n")
+  
+  tune_res_default <- readRDS(tune_file_default) #load prior tuning results if we have them
+  fit_default_full <- readRDS(model_file_default)
+  
+} else {
+  cat(">>> Running tune_grid() and fitting default model...\n")
+  #tuning the model
+  set.seed(123)
+  tune_res_default <- tune_grid(
+    wf_default,
+    resamples = folds_default,
+    grid      = grid_default,
+    metrics   = metric_set_default,
+    control   = control_grid(
+      save_pred     = TRUE,
+      parallel_over = "resamples"
+    )
+  )
+  
+  saveRDS(tune_res_default, tune_file_default)
+  
+  best_default <- select_best(tune_res_default, metric = "roc_auc")
+  
+  final_wf_default <- finalize_workflow(wf_default, best_default)
+  
+  fit_default_full <- final_wf_default |>
+    fit(data = train_class)
+  
+  saveRDS(fit_default_full, model_file_default)
+  show_notes(tune_res_default)
+  cat(">>> Saved tuning + final default model\n")
+}
+```
+
+
+
+ROC/AUC:
+```{r}
+best_default <- select_best(tune_res_default, metric = "roc_auc")               #displays the best ROC
+best_default
+
+final_wf_default <- finalize_workflow(wf_default, best_default)    #updates the workflow with the best parameters from the
+
+fit_default <-final_wf_default|>                                   #fits the workflow with 
+  fit(data = train_data)
+```
+**SET DESIRED MANUAL CUTOFF**
+```{r}
+manual_cutoff <- .18
+```
+
+Run on validation set for default
+```{r}
+#setting up the validation model to see if 4 hours of tuning and 1 week of troubleshooting an XGBOOST model was worth it.
+
+val_pred_default <- predict(fit_default, val_data, type = "prob") |>  #we are going predict the probability of the class in a new column
+ bind_cols(predict(fit_default, val_data, type = "class")) |>         #Adds another column for the predicted class label
+ bind_cols(val_data |> dplyr:: select(default))                       #Adds column with actual result
+
+
+val_pred_default <- val_pred_default |>
+  mutate(
+    pred_custom = if_else(
+      .pred_default > manual_cutoff,                                            #added a manual cutoff so, we can weight the model.
+      "default",
+      "nondefault"
+    ),
+    pred_custom = factor(pred_custom, levels = c("nondefault","default"))
+  )
+
+metrics_default_val <- val_pred_default |>                            #Calculates the Accuracy and Kappa compares the predicted vs actual
+  metrics(truth = default, estimate = .pred_class)
+
+roc_default_val <- val_pred_default |>                                #Calculates the AUC
+  roc_auc(truth = default, .pred_default, event_level = "second")
+
+cm_default_val <-val_pred_default |>
+ conf_mat(truth = default, estimate = .pred_class)                     #prepares a confusion matrix
+
+cat("\n Default Model - Validation Performance \n")                   #prints the metrics out, doing it this way for easy transfer to the paper and ppt.
+print(metrics_default_val)
+print(roc_default_val)
+print(cm_default_val)
+
+#run metrics using the manual cutoff:
+
+metrics_custom <- val_pred_default |>
+  metrics(truth = default, estimate = pred_custom)
+
+roc_custom <- val_pred_default |>
+  roc_auc(truth = default, .pred_default, event_level = "second")
+
+cm_custom <- val_pred_default |>
+  conf_mat(truth = default, estimate = pred_custom)
+
+cat("\n Default Model -Valuation Performance (custom .18 Cutoff\n")
+print(metrics_custom)
+print(roc_custom)
+print(cm_custom)
+
+```
+ROC Curve 
+```{r}
+library(ggplot2)
+
+roc_data <- val_pred_default |>
+  roc_curve(truth = default, .pred_default)
+
+autoplot(roc_data) +
+  ggtitle("ROC Curve – Default Model") +
+  theme_minimal()
+```
+
+
+
+ 
+ 
+ 
+ Predicted Probability Distribution Plot
+```{r}
+val_pred_default |>
+  ggplot(aes(x = .pred_default, fill = default)) +
+  geom_density(alpha = 0.4) +
+  ggtitle("Probability Distribution by Class") +
+  theme_minimal()
+```
+Lift
+```{r}
+lift_data <- val_pred_default |>
+  lift_curve(truth = default, .pred_default)
+
+autoplot(lift_data) +
+  ggtitle("Lift Curve – Default Model") +
+  theme_minimal()
+```
+
+Gain
+```{r}
+gain_data <- val_pred_default |>
+  gain_curve(truth = default, .pred_default)
+
+autoplot(gain_data) +
+  ggtitle("Gain Curve – Default Model") +
+  theme_minimal()
+```
+
+
+ 
+Step 2 Loss Model (regression)
+```{r}
+#We do all the tuning in the training set, so the validation set just gives us a double check, so we are hardcoding the settings (I'm running on 1 core b/c Xboost crashes if we go parallel, so it doesn't make sense to go fancy on the validation data)
+
+
+
+# Recipe for loss
+rec_loss <- recipe(loss ~ ., data = train_loss) |>
+  step_zv(all_predictors())
+
+# Specs for the regression step – manually chosen hyperparameters
+loss_spec <- boost_tree(
+  mode        = "regression",
+  trees       = 200,
+  tree_depth  = 5,
+  learn_rate  = 0.1,
+  min_n       = 20,
+  loss_reduction = 0,
+  sample_size = 0.8
+) |>
+  set_engine("xgboost",
+             nthread = 1)    # 1 thread is safest; 2 is okay if it behaves
+
+# Workflow for the regression model
+wf_loss <- workflow() |>
+  add_model(loss_spec) |>
+  add_recipe(rec_loss)
+
+# So we can knit: look for a saved model first, otherwise fit + save
+loss_model_file <- "xgb_loss_model.rds"
+
+if (file.exists(loss_model_file)) {
+  cat(">>> Using saved loss model\n")
+  fit_loss <- readRDS(loss_model_file)
+} else {
+  cat(">>> Fitting loss model on all defaults and saving...\n")
+  set.seed(123)
+  fit_loss <- wf_loss |>
+    fit(data = train_loss)
+  saveRDS(fit_loss, loss_model_file)
+  cat(">>> Saved loss model to", loss_model_file, "\n")
+}
+
+# (Optional) quick in-sample performance check – NOT resampled
+train_loss_pred <- predict(fit_loss, train_loss) |>
+  bind_cols(train_loss |> dplyr::select(loss))
+
+metrics(train_loss_pred, truth = loss, estimate = .pred)
+
+```
+Final models refit on all training data
+
+If you’re satisfied with the tuned hyperparameters, it’s good practice to refit the default model on all of train_class:
+
+```{r}
+
+#refit the default model on the full data set using the best parameters *note that the fit_loss is already trained on all defaults.
+final_wf_default_full <- finalize_workflow(wf_default, best_default)
+
+fit_default_full <- final_wf_default_full |>
+  fit(data = train_class)
+
+
+```
+
+
+Feature Imporance
+```{r}
+library(workflows)
+library(xgboost)
+
+# Extract the fitted parsnip model
+xgb_fit <- extract_fit_parsnip(fit_default_full)
+
+# Extract the underlying xgboost booster object
+xgb_model <- xgb_fit$fit
+
+importance_matrix <- xgb.importance(model = xgb_model)
+
+xgb.plot.importance(importance_matrix[1:20, ])
+
+title("Top 20 Feature Importance – XGBoost Default Model")
+```
+
+
+
+
+
+
+Predict on test set and enforce loss = 0 when no default
+ 
+```{r}
+#Sanity check 
+#double check that our ID's and test_clean have the same length before reuniting them
+nrow(test_clean)
+length(Test_ID)
+
+stopifnot(nrow(test_clean) == length(Test_ID))
+
+
+test_pred_default <- predict(fit_default_full, test_clean, type = "prob") |> 
+  bind_cols(predict(fit_default_full, test_clean, type = "class"))
+
+test_pred_default <- test_pred_default |>
+  rename(pred_class = .pred_class)
+
+head(test_pred_default$.pred_default)  #take a look
+
+
+```
+Apply manual cutoff
+```{r}
+
+#Here we are applying our manual cutoff that we adjusted for while reconciling the training data. if the defulat cutoff is larger than  the custom cutoff then use the custom cutoff
+test_pred_default <- test_pred_default |>
+  mutate(
+    pred_custom = if_else(
+      .pred_default > manual_cutoff, #manual cutoff
+      "default",
+      "nondefault"
+    ),
+    pred_custom = factor(pred_custom, levels = c("nondefault", "default"))
+  )
+
+head(test_pred_default$pred_custom)
+
+
+```
+
+ 
+ Predict the loss
+```{r}
+
+test_pred_loss_raw <- predict(fit_loss, test_clean)$.pred #apply the tuned model to predict the loss. 
+
+length(test_pred_loss_raw)
+
+```
+ 
+ add the zero loss back in
+ We use the predicted class (pred_class) to decide:
+```{r}
+
+test_loss_final <- if_else(                     #Using this to setup the formatting required by the assignment   id, loss, adding making sure that the non defaults have a zero
+  test_pred_default$pred_custom == "default",    #make test_los_final if the field is default, then 1 else 0, using the manual_cutoff
+  test_pred_loss_raw,
+  0
+)
+
+summary(test_loss_final)
+```
+ 
+Final output: ID, loss (assignment format)
+
+We now combine test_ID and the final loss predictions
+```{r}
+#create the final version expected for turning in id, loss
+getwd()
+
+final_output <- tibble(
+  id     = Test_ID,
+  loss   =test_loss_final
+)
+
+write.csv(final_output, "submission_predictions.csv", row.names = FALSE)
+
+#check it out
+head(final_output)
+
+```
+
+
+
+Turn off Parallel **abandoned step when parallel processing kept crashing my computer**
+```{r}
+#turn parallel processing off -- disarmed afer retraining crash
+#plan(sequential)
+
+#cat("Parallel plan reset to sequential\n")
+```
+
+**Model Notes**
+We added a lot of functionality to this model. 
+1. getwd() -reminder to get you working directory prior to running the model
+2. Check for saved parmeters, when the the model is executed, if there are saved parmeters, it will run with those and not retrain, if there are not saved parameters, it will train (we had to do this for sanity).
+3. Manual Cutoff: this model allows you to set a manual cutoff and it will run against the standard .5, so you can make adjustments and if you set the manual cutoff and the threshold is less than the default threshold, then it will use the Manual cutoff.
+4. The model will automatically save new parameters each time new ones are set in the working directory
+
+
+
